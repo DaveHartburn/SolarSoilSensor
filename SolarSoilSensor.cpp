@@ -1,7 +1,16 @@
+/******************************************************/
+//       THIS IS A GENERATED FILE - DO NOT EDIT       //
+/******************************************************/
+
+#include "Particle.h"
+#line 1 "/home/dave/priv/arduino/Particle/SolarSoilSensor/src/SolarSoilSensor.ino"
 /* solar_soil_sensor - Dave Hartburn, April 2020
  *
  * Xenon based solar powered soil sensor. Intended to be based in the garden and run for a few
  * months reporting soil moisture content with environmental details.
+ * 
+ * BLE version - rather than Particle.publish, particle cloud functions are disabled and
+ * data sent as a JSON string over BLE. Due to mesh retirement.
  *
  * Hardware:
  *  Particle Xenon (though Argon may also be an option after the mesh is discontinued)
@@ -10,7 +19,7 @@
  *  Solar cell (85x115 or 80x55 depending on model)
  *  L7805cv voltage regulator
  *  Capacitive Soil Moisture Sensor v1.2
- *  200mah battery (also have 18650s)
+ *  2000mah battery (also have 18650s)
  *
  * Brief wiring description:
  * BME280 and INA219, both I2C devices connected to power, SDA (D0), SCL (D1)
@@ -33,19 +42,14 @@
  * Both on: Dev/test mode with short delay
 */
 
-/* To Do:
- *  Thingsboard:
- *    Graphs of 1
- *    Graphs of 2
- *    Combined graphs
- *    Alert on low soil moisture
- *    Alert on no input for +2 hours
- */
- 
 // Define DEVSLEEP if you want the device to sleep - for live use
 // comment out for testing, which will just delay for a short while
 // Very difficult to re-flash when it keeps falling into sleep mode!
 //#define DEVSLEEP 1
+void setup();
+void loop();
+int setAntenna(int i);
+#line 43 "/home/dave/priv/arduino/Particle/SolarSoilSensor/src/SolarSoilSensor.ino"
 #define SLEEPTIME   300     // Sleep for 5 minutes
 #define TESTDELAY   5000    // check every 5 seconds
 
