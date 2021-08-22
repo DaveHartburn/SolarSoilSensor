@@ -8,20 +8,11 @@
 SerialLogHandler logHandler(LOG_LEVEL_WARN, { {"app", LOG_LEVEL_ALL} });
 #endif
 
+// Include device IDs. See comments
+#include <deviceIDs.h>
 
 
 
-// Structure of names & IDs. Used for sending BLE messages
-struct devID {
-  String id;
-  String name;
-};
-
-// Testing if I can obscure these
-devID deviceIDs[] = {
-  {"xxxxxxxxxxxxxxxxx", "BLE-Xen1"},
-  {"yyyyyyyyyyyyyyyyy", "BLE-Xen6"}
-};
 
 void setup() {
     if(USESERIAL==1) {
@@ -32,6 +23,9 @@ void setup() {
 
 void loop() {
     sendMessage("Test", "In a loop");
+    char s[100];
+    sprintf(s, "device id 0 is %s, %s", deviceIDs[0].id.c_str(), deviceIDs[0].name.c_str());
+    sendMessage("Test", s);
     delay(5000);
 }
 
