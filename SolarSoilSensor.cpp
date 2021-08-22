@@ -4,42 +4,257 @@
 
 #include "Particle.h"
 #line 1 "/home/dave/priv/arduino/Particle/SolarSoilSensor/src/SolarSoilSensor.ino"
-// Minimalistic - build up slowly due to errors I was getting
+/* SolarSoilSensor - Dave Hartburn, April 2020
+ *
+ * Particle Xenon based solar powered soil sensor. Intended to be based in the garden and run for a few
+ * months reporting soil moisture content with environmental details.
+ * 
+ * BLE version - rather than Particle.publish, particle cloud functions are disabled and
+ * data sent as a JSON string over BLE. Due to mesh retirement.
+ *
+ * Hardware:
+ *  Particle Xenon (though Argon may also be an option after the mesh is discontinued)
+ *  INA219 current monitoring board
+ *  BME280 environmental sensor
+ *  Solar cell (85x115 or 80x55 depending on model)
+ *  L7805cv voltage regulator
+ *  Capacitive Soil Moisture Sensor v1.2
+ *  2000mah battery (also have 18650s)
+ *
+ * Brief wiring description:
+ * BME280 and INA219, both I2C devices connected to power, SDA (D0), SCL (D1)
+ * INA219 Vin+ (power in) connects to the solar panel via a IN5819 diode. This allows us to monitor the total generated voltage rather than the regulated
+ *   Vin- (power out) connects through the V7805cv then to VUSB.
+ *   2 x 10uF capacitors between the pins on the V7805cv
+ * Soil mositure, to power and A2
+ *
+ * A twin dip switch runs on ports D4 and D5 (other end to GND) to configure test mode
+ * (short delay, no sleep) (switch 1 to ON) and sleep mode (switch 1 to OFF) and a delay
+ * time (switch 2 to ON for short delay, OFF for long). Config status only checked on
+ * boot.
+ * Switch   Status  digRead     slMode/delay
+ *   1        ON      LOW         0 - wait
+ *   1        OFF     HIGH        1 - sleep
+ *   2        ON      LOW         Short
+ *   2        OFF     HIGH        Long
+ *   
+ * Both off: Normal sleep mode with the longer delay (also default if switch fails)
+ * Both on: Dev/test mode with short delay
+*/
 
 void setup();
 void loop();
-void sendMessage(char *type, char *msg);
-#line 3 "/home/dave/priv/arduino/Particle/SolarSoilSensor/src/SolarSoilSensor.ino"
+void sendMessage( String type, String msg);
+int setAntenna(int i);
+#line 39 "/home/dave/priv/arduino/Particle/SolarSoilSensor/src/SolarSoilSensor.ino"
 #define BLEMODE   0     // zero to use the traditional Particle.publish
 #define USESERIAL 1     // zero ignore the serial port. Will give battery savings
 #define CALIBRATE 0     // 1 to enter soil calibration mode over serial (can't use particle function)
 
+#if BLEMODE==1
+    // Do not use mesh
+    SYSTEM_MODE(MANUAL)
+#endif
+// Enable serial
 #if USESERIAL==1
-SerialLogHandler logHandler(LOG_LEVEL_WARN, { {"app", LOG_LEVEL_ALL} });
+    SerialLogHandler logHandler(LOG_LEVEL_WARN, { {"app", LOG_LEVEL_ALL} });
 #endif
 
 // Include device IDs. See comments
 #include <deviceIDs.h>
+String devName="Unk-Xen";  // Default device name, max 8 chars. Will need to change to deploy elsewhere
 
+#define CONFPIN_SLEEP   D4
+#define CONFPIN_DELAY   D5
+#define DELAY_SHORT     5000    // Short delay - 5 seconds
+#define DELAY_LONG      15000   // 15 seconds
+#define SLEEP_SHORT     60     // Sleep for 1 minutes
+#define SLEEP_LONG      300     // Sleep for 5 minutes
 
+// Init INA219 sensor
+#include <adafruit-ina219.h>
+Adafruit_INA219 sensor219;
 
+// Init BME280
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+Adafruit_BME280 bme;
+// Set up BME
+#define BME_ADDRESS 0x76    // Use i2c_scanner to determine address
+
+#define SOILPIN A2
+
+// Fix to allow antenna selection to work. Conflict in EXTERNAL being used twice
+#undef EXTERNAL
+
+double batVolts=0.0;
+float pres, temp, humid;
+String jsonOut;
+int soilValue;
+int soilPC=0;         // Soil percentage
+int waitTime;       // How long to wait between readings
+int slMode;          // Sleep mode: 1 sleep, 2 just wait
+int antenna;        // 0 for internal - default, 1 for external
+
+// Sensor calibration values
+int soilDry = 4095;        // Soil dry value (used for calibrated readout)
+int soilWet = 0;        // 100% wet, i.e. sensor in water
+int setSoilDry(int i);
+int setSoilWet(int i);
+// Cloud functions to set calibration - must use string
+int setSoilDryStr(String s);
+int setSoilWetStr(String s);
+// One to set the antenna
+int setAntennaStr(String s);
+
+// Where to store in EEPROM
+int dryAddr = 0;    // (int is only 2 bytes)
+int wetAddr = 4;    // Giving extra space for future expansion
+int antAddr = 8;    // Antenna type
 
 void setup() {
     if(USESERIAL==1) {
         waitFor(Serial.isConnected, 3000);
-        Log.info("Starting BLE Solar Soil Sensor with device ID "+System.deviceID()+"....");
     }
+    // Send initial message
+    sendMessage("Start", "Soil sensor awake with device ID "+System.deviceID());
+
+    // Start I2C
+    sensor219.begin();
+    Wire.begin();
+    
+    // Check power and charging status
+    pinMode(PWR, INPUT);
+    pinMode(CHG, INPUT);
+
+    if(bme.begin(BME_ADDRESS)) {
+        sendMessage("Start", "BME Sensor found");
+    } else {
+        sendMessage("Start", "Warning: No BME sensor found");
+    }
+    pinMode(SOILPIN,INPUT);
+    
+    // Init config pins
+    pinMode(CONFPIN_SLEEP, INPUT_PULLUP);
+    pinMode(CONFPIN_DELAY, INPUT_PULLUP);
+    
+    int pinSleep = digitalRead(CONFPIN_SLEEP);
+    int pinDelay = digitalRead(CONFPIN_DELAY);
+    
+    char msg[100];
+    if(pinSleep == HIGH) {
+        // switch 1 is off, use sleep mode
+        slMode=1;
+        if(pinDelay == HIGH) {
+            // Switch is off, use long delay
+            waitTime = SLEEP_LONG;
+        } else {
+            // Switch is on, use short delay
+            waitTime = SLEEP_SHORT;
+        }
+    } else {
+        // Switch 1 is off, use wait mode
+        slMode=0;
+        if(pinDelay == HIGH) {
+            // Switch is off, use long delay
+            waitTime = DELAY_LONG;
+        } else {
+            // Switch is on, use short delay
+            waitTime = DELAY_SHORT;
+        }
+        
+    }
+    sendMessage("Start", String::format("Sleep mode = %d, waitTime = %d", slMode, waitTime));
+
+    // Register cloud variables if not in BLE mode
+    #if BLEMODE==0
+        Particle.variable("soilPC", soilPC);
+        Particle.variable("batVolts", batVolts);
+        
+        // Register calibration functions
+        Particle.function("setSoilWet", setSoilWetStr);
+        Particle.function("setSoilDry", setSoilDryStr);
+        Particle.function("setAntenna", setAntennaStr);
+    #endif
+
+    // Get wet and dry values from EEPROM
+    int sd, sw;
+    EEPROM.get(dryAddr, sd);
+    EEPROM.get(wetAddr, sw);
+    if(sd < 0 || sd > 4095) {
+        // EEPROM default value, set to defaults in header
+        setSoilDry(soilDry);
+    } else {
+        soilDry=sd;
+    }
+    if(sw < 0 || sw > 4095) {
+        // EEPROM default value, set to defaults in header
+        setSoilWet(soilWet);
+    } else {
+        soilWet=sw;
+    }
+    
+    // Which antenna to use?
+    EEPROM.get(antAddr, antenna);
+    setAntenna(antenna);    
+
 }
 
 void loop() {
-    sendMessage("Test", "In a loop");
-    char s[100];
-    sprintf(s, "device id 0 is %s, %s", deviceIDs[0].id.c_str(), deviceIDs[0].name.c_str());
-    sendMessage("Test", s);
-    delay(5000);
+    // Read power details
+    float busVoltage = 0;
+    float current = 0; // Measure in milli amps
+    float power = 0;
+
+    busVoltage = sensor219.getBusVoltage_V();
+    current = sensor219.getCurrent_mA();
+    power = busVoltage * (current/1000); // Calculate the Power    
+    
+    int inputPwr, inputChg, charge, onBatteryPower;
+    
+    batVolts = analogRead(BATT) * 0.0011224;
+
+    inputPwr=digitalRead(PWR);
+    inputChg=digitalRead(CHG);
+
+    charge = (inputPwr && !inputChg);  // 0 = Not Charging
+    onBatteryPower = (!inputPwr);              // 0 = Not on Battery Power
+
+    // Read soil sensor value
+    int s = analogRead(SOILPIN);
+    
+    // Read BME environmental data
+    temp = bme.readTemperature();
+    humid = bme.readHumidity();
+    pres = bme.readPressure() / 100.0F;
+    
+    // Debug output (comment out) to ensure we are setting soil calibration from cloud
+    //Particle.publish("debug", String::format("soilDry %d, soilWet %d", soilDry, soilWet), PRIVATE);
+    
+    // Calculate moisture as a percentage
+    // Sensor reads high value = dry, low value = wet. Makes more sense if 100% moisture
+    // is very wet and 0 is very dry, so invert.
+    int r = soilDry-soilWet;        // Range of values
+    soilPC = 100-((s-soilWet)*100/r);
+    
+    // Output data as one large JSON
+    jsonOut=String::format("{'battery': %0.2f; 'busVoltage': %0.2f; 'soilMoisture': %d; 'soilPC': %d; 'humidity': %0.2f; 'temperature': %0.2f; 'pressure': %0.2f}",
+        batVolts, busVoltage, soilPC, humid, temp, pres);
+    sendMessage("SoilData", jsonOut);
+    
+    if(slMode==1) {
+        // Sleep mode, use deep sleep function
+        sendMessage("System", "Going to sleep");
+        System.sleep(D8, RISING, waitTime);
+    } else {
+        // Just wait mode, stay alive
+        sendMessage("System", "Waiting...");
+        delay(waitTime);
+    }
+    sendMessage("System", "Awake again");
 }
 
-void sendMessage(char *type, char *msg) {
+void sendMessage( String type, String msg) {
     // Send data via Particle.publish, unless we are in BLE mode then output to serial (if active)
     if(BLEMODE==1) {
         // Currently dropping messages
@@ -49,4 +264,60 @@ void sendMessage(char *type, char *msg) {
     if(USESERIAL==1) {
         Log.info(msg);
     }
+}
+
+// Calibration functions - called from cloud
+int setSoilWetStr(String s) {
+    int i;
+    i = s.toInt();
+    setSoilWet(i);
+    return 0;
+}
+int setSoilDryStr(String s) {
+    int i;
+    i = s.toInt();
+    setSoilDry(i);
+    return 0;
+}
+int setAntennaStr(String s) {
+    int i,j;
+    i = s.toInt();
+    j = setAntenna(i);
+    if(i==0) {
+        sendMessage("Message", "Changed to internal antenna");
+    } else {
+        sendMessage("Message", "Changed to external antenna");
+    }
+    return j;
+}
+// Actual functions after conversion
+int setSoilWet(int i) {
+    soilWet=i;
+    EEPROM.put(wetAddr, i);
+    sendMessage("Message", "Soil wet value set");
+    return 0;
+}
+int setSoilDry(int i) {
+    soilDry=i;
+    EEPROM.put(dryAddr, i);
+    sendMessage("Message", "Soil dry value set");
+    return 0;
+}
+int setAntenna(int i) {
+    // Save to EEPROM
+    EEPROM.put(antAddr, i);
+    #if BLEMODE==0
+        if(i==0) {
+            Mesh.selectAntenna(MeshAntennaType::INTERNAL);
+        } else {
+            Mesh.selectAntenna(MeshAntennaType::EXTERNAL);
+        }
+    #else
+        if(i==0) {
+           BLE.selectAntenna(BleAntennaType::INTERNAL);
+        } else {   
+           BLE.selectAntenna(BleAntennaType::EXTERNAL);
+        }
+    #endif
+    return i;
 }
