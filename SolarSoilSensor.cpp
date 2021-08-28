@@ -40,21 +40,39 @@
  *   
  * Both off: Normal sleep mode with the longer delay (also default if switch fails)
  * Both on: Dev/test mode with short delay
+ * 
+ * To Do
+ * -----
+ * Sensible sleeping without BLE on
+ * Enable calibration without cloud
 */
 
 void setup();
 void loop();
 void sendMessage( String type, String msg);
 int setAntenna(int i);
-#line 39 "/home/dave/priv/arduino/Particle/SolarSoilSensor/src/SolarSoilSensor.ino"
-#define BLEMODE   0     // zero to use the traditional Particle.publish
-#define USESERIAL 1     // zero ignore the serial port. Will give battery savings
+#line 44 "/home/dave/priv/arduino/Particle/SolarSoilSensor/src/SolarSoilSensor.ino"
+#define BLEMODE   1     // zero to use the traditional Particle.publish
+#define USESERIAL 0     // zero ignore the serial port. Will give battery savings
 #define CALIBRATE 0     // 1 to enter soil calibration mode over serial (can't use particle function)
+                        // Not yet implemented
 
 #if BLEMODE==1
     // Do not use mesh
     SYSTEM_MODE(MANUAL)
 #endif
+
+// Although not used in normal cloud mode, we still define the BLE constants so the rest of the code compiles
+#define CONNECT_TIMEOUT 45     // How long to time out waiting for a connection in seconds
+#define SEND_ATTEMPTS 5       // How many times to try and send the data
+#define SEND_INTERVAL 5
+
+// Define BLE services
+const BleUuid homeBLEservice("d1bedc42-0328-11ec-9a03-0242ac130003");   // UUID to use for all home BLE->Cloud services
+// JSON string to combine all values
+BleCharacteristic jsonOutChar("JSON", BleCharacteristicProperty::NOTIFY, BleUuid("d692e9d8-1c92-4b3d-b387-801247613d66"), homeBLEservice);
+
+
 // Enable serial
 #if USESERIAL==1
     SerialLogHandler logHandler(LOG_LEVEL_WARN, { {"app", LOG_LEVEL_ALL} });
@@ -99,6 +117,8 @@ int antenna;        // 0 for internal - default, 1 for external
 // Sensor calibration values
 int soilDry = 4095;        // Soil dry value (used for calibrated readout)
 int soilWet = 0;        // 100% wet, i.e. sensor in water
+
+// Function prototypes
 int setSoilDry(int i);
 int setSoilWet(int i);
 // Cloud functions to set calibration - must use string
@@ -122,7 +142,16 @@ void setup() {
     // Start I2C
     sensor219.begin();
     Wire.begin();
-    
+
+    // Work out name
+    int l=sizeof(deviceIDs)/sizeof(devID);
+    for(int i=0; i<l; i++) {
+        if(deviceIDs[i].id==System.deviceID()) {
+            devName=deviceIDs[i].name;
+            sendMessage("Start", "Set device name to "+devName);
+        }
+    }
+
     // Check power and charging status
     pinMode(PWR, INPUT);
     pinMode(CHG, INPUT);
@@ -175,6 +204,9 @@ void setup() {
         Particle.function("setSoilWet", setSoilWetStr);
         Particle.function("setSoilDry", setSoilDryStr);
         Particle.function("setAntenna", setAntennaStr);
+    #else
+        // Add characteristic to BLE 
+        BLE.addCharacteristic(jsonOutChar);
     #endif
 
     // Get wet and dry values from EEPROM
@@ -198,6 +230,7 @@ void setup() {
     EEPROM.get(antAddr, antenna);
     setAntenna(antenna);    
 
+    sendMessage("Start", String::format("soilDry=%d, soilWet=%d, antenna=%d", soilDry, soilWet, antenna));
 }
 
 void loop() {
@@ -236,19 +269,23 @@ void loop() {
     // is very wet and 0 is very dry, so invert.
     int r = soilDry-soilWet;        // Range of values
     soilPC = 100-((s-soilWet)*100/r);
-    
+
     // Output data as one large JSON
-    jsonOut=String::format("{'battery': %0.2f; 'busVoltage': %0.2f; 'soilMoisture': %d; 'soilPC': %d; 'humidity': %0.2f; 'temperature': %0.2f; 'pressure': %0.2f}",
-        batVolts, busVoltage, soilPC, humid, temp, pres);
+    jsonOut=String::format("{'battery': %0.2f, 'busVoltage': %0.2f, 'soilMoisture': %d, 'soilPC': %d, 'humidity': %0.2f, 'temperature': %0.2f, 'pressure': %0.2f}",
+        batVolts, busVoltage, s, soilPC, humid, temp, pres);
     sendMessage("SoilData", jsonOut);
     
     if(slMode==1) {
         // Sleep mode, use deep sleep function
-        sendMessage("System", "Going to sleep");
+        sendMessage("System", "Going to deep sleep");
+        // Make absolutely sure BLE is off, on but sleeping can cause a gateway crash
+        if(BLEMODE==1) {
+            BLE.off();
+        }
         System.sleep(D8, RISING, waitTime);
     } else {
         // Just wait mode, stay alive
-        sendMessage("System", "Waiting...");
+        sendMessage("System", "Waiting, not deep sleeping...");
         delay(waitTime);
     }
     sendMessage("System", "Awake again");
@@ -257,8 +294,79 @@ void loop() {
 void sendMessage( String type, String msg) {
     // Send data via Particle.publish, unless we are in BLE mode then output to serial (if active)
     if(BLEMODE==1) {
-        // Currently dropping messages
+        if(type=="SoilData") {
+            // This is data we want to send
+            // We don't just send the JSON data, it needs to be nested as a payload.
+            String sendStr=String::format("{\"sensorName\": \"%s\", \"apiKey\": \"unset\", \"payload\":\"%s\"}",
+      devName.c_str(), msg.c_str());
+            sendMessage("", "Soil data received, BLE sending "+sendStr);
+
+            // Don't restart BLE if already connected
+            if(!BLE.connected()) {
+                // Turn on BLE
+                BLE.on();
+                // Set up BLE data
+                BleAddress badd=BLE.address();
+                sendMessage("", String::format("Starting BLE service with address %02x:%02x:%02x:%02x:%02x:%02x", badd[5], badd[4], badd[3], badd[2], badd[1], badd[0]));
+
+                BleAdvertisingData bleData;
+                // Add data to the advertising object
+                bleData.appendLocalName(devName);  // Max of 8 characters with 128-bit UUID
+                bleData.appendServiceUUID(homeBLEservice);
+                BLE.advertise(&bleData);
+            }
+
+
+            // Wait while we send the message via BLE (if needed)
+            unsigned long timeout=millis()+CONNECT_TIMEOUT*1000;
+            boolean quitLoop=false;
+            unsigned long nextSend;
+            boolean hasConnected=false;   // Track if we were ever connected
+            int sendAttempts=0;            // Track how many times we try to send data
+
+            while(quitLoop==false) {
+                //Log.info("Inner loop");
+                if(BLE.connected()) {
+                    // We have made a connection, assume this is to the gateway
+                    if(hasConnected==false) {
+                        // First time this has connected
+                    hasConnected=true;
+                        nextSend=millis()+3000; // Give 3s for the connection to be established before sending
+                        sendMessage("log", "BLE connection made");
+                    }
+                    if(millis()>nextSend) {
+                        // Try multiple time to send value until disconnected or limit reached
+                        sendMessage("log", "Sending data");
+                        jsonOutChar.setValue(sendStr);
+                        // Increase counter and set next time
+                        sendAttempts++;
+                        nextSend=millis()+SEND_INTERVAL*1000;
+                        if(sendAttempts>SEND_ATTEMPTS) {
+                            sendMessage("log", "Reached maximum send attemps");
+                            quitLoop=true;
+                        }
+                    }
+                } else {
+                    // Not BLE connected
+                    // Have we previously connected?
+                    if(hasConnected==true) {
+                        // Yes, gateway has dropped the connection, drop into deepsleep
+                        sendMessage("log", "Central device disconnected us");
+                        quitLoop=true;
+                    } else {
+                        // Never connected
+                        if(millis()>timeout) {
+                            sendMessage("log", "Timeout");
+                            quitLoop=true;
+                        }
+                    }
+                }
+            }           
+        }
+        // Anything other than soil data is dropped
+        // End of BLE mode check
     } else {
+        // Not BLE, send with particle
         Particle.publish(type, msg);
     }
     if(USESERIAL==1) {
